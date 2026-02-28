@@ -4,25 +4,29 @@ import { ethers } from "ethers";
 import crypto from "crypto";
 
 dotenv.config();
-
 const app = express();
 app.use(express.json());
 
-// ================= ENV =================
+// ===== ENV =====
 const API_KEY = process.env.API_KEY || "";
 const RPC_HTTP = process.env.RPC_HTTP;
 const PRIVATE_KEY = process.env.HOT_WALLET_PRIVATE_KEY;
-const USDT_CONTRACT = process.env.USDT_CONTRACT || "0x55d398326f99059fF775485246999027B3197955";
-const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY;
+
+// USDT BEP20 on BSC
+const USDT_CONTRACT =
+  process.env.USDT_CONTRACT || "0x55d398326f99059fF775485246999027B3197955";
+
+// NEW: Etherscan API Key (used for BSC via chainid=56)
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY;
 
 const POLL_MS = Number(process.env.POLL_MS || 12000);
 const PORT = Number(process.env.PORT || 3000);
 
-// unique amount tags like 10.001, 10.002 ...
+// Unique amount tags
 const TAG_STEP = Number(process.env.TAG_STEP || 0.001);
 const TAG_MAX = Number(process.env.TAG_MAX || 0.099);
 
-// ================= AUTH =================
+// ===== AUTH =====
 function requireApiKey(req, res, next) {
   const key = req.header("x-api-key");
   if (!key || key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
@@ -34,13 +38,13 @@ function die(msg) {
   process.exit(1);
 }
 
-// ================= CHECK ENV =================
+// ===== CHECK ENV =====
 if (!API_KEY) die("API_KEY missing");
 if (!RPC_HTTP) die("RPC_HTTP missing");
 if (!PRIVATE_KEY) die("HOT_WALLET_PRIVATE_KEY missing");
-if (!BSCSCAN_API_KEY) die("BSCSCAN_API_KEY missing");
+if (!ETHERSCAN_API_KEY) die("ETHERSCAN_API_KEY missing");
 
-// ================= CHAIN =================
+// ===== CHAIN =====
 const provider = new ethers.JsonRpcProvider(RPC_HTTP);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
@@ -55,9 +59,9 @@ const usdtWrite = usdtRead.connect(wallet);
 
 let DECIMALS = 18;
 
-// ================= STORAGE (in-memory) =================
-// NOTE: Railway restart clears memory. Works for simple use.
-// For production: use Postgres (I can provide).
+// ===== STORAGE (in-memory) =====
+// NOTE: Railway restart clears this memory.
+// For production you should use Postgres.
 const invoices = new Map();
 // invoice = { id, requestedAmount, payAmount, tag, status, toAddress, createdAt, txHash }
 let lastProcessedTime = 0;
@@ -65,49 +69,45 @@ let lastProcessedTime = 0;
 function nowIso() {
   return new Date().toISOString();
 }
-
 function roundTo3(n) {
   return Math.round(n * 1000) / 1000;
 }
-
 function allocateTag() {
-  // avoid collisions: pick a tag not used by other pending invoices
   const used = new Set();
   for (const inv of invoices.values()) {
     if (inv.status === "pending") used.add(inv.tag);
   }
-
   for (let t = TAG_STEP; t <= TAG_MAX + 1e-12; t += TAG_STEP) {
     const tag = roundTo3(t);
     if (!used.has(tag)) return tag;
   }
   return null;
 }
-
-// compare using smallest unit to avoid floating problems
 function amountsEqual(aStr, bStr) {
   const a = ethers.parseUnits(String(aStr), DECIMALS);
   const b = ethers.parseUnits(String(bStr), DECIMALS);
   return a === b;
 }
 
-// ================= BSCSCAN =================
+// ===== ETHERSCAN API V2 (BSC = chainid 56) =====
 async function fetchIncomingUsdtTransfers() {
   const address = wallet.address;
 
   const url =
-    "https://api.bscscan.com/api" +
-    `?module=account&action=tokentx` +
+    "https://api.etherscan.io/api" +
+    `?chainid=56` +
+    `&module=account&action=tokentx` +
     `&contractaddress=${USDT_CONTRACT}` +
     `&address=${address}` +
     `&page=1&offset=50&sort=desc` +
-    `&apikey=${BSCSCAN_API_KEY}`;
+    `&apikey=${ETHERSCAN_API_KEY}`;
 
   const r = await fetch(url);
   const data = await r.json();
 
+  // status "1" OK, "0" = No transactions found or error
   if (!data || !data.result) return [];
-  if (data.status !== "1") return []; // includes "No transactions found"
+  if (data.status !== "1") return [];
   return data.result;
 }
 
@@ -115,8 +115,8 @@ function formatTokenAmount(rawValue) {
   return ethers.formatUnits(rawValue, DECIMALS);
 }
 
-// ================= ROUTES =================
-app.get("/", (req, res) => res.send("BSC USDT gateway running"));
+// ===== ROUTES =====
+app.get("/", (req, res) => res.send("BSC USDT gateway running (Etherscan API V2)"));
 
 app.get("/api/info", requireApiKey, (req, res) => {
   res.json({
@@ -134,7 +134,7 @@ app.get("/api/balance", requireApiKey, async (req, res) => {
   res.json({ address: wallet.address, usdt: ethers.formatUnits(bal, DECIMALS) });
 });
 
-// Create invoice with unique amount (10 -> 10.001 etc)
+// Create invoice: amount 10 -> payAmount 10.001, 10.002...
 app.post("/api/invoices", requireApiKey, (req, res) => {
   const { amount } = req.body;
   const n = Number(amount);
@@ -190,7 +190,7 @@ app.post("/api/send", requireApiKey, async (req, res) => {
   }
 });
 
-// ================= DEPOSIT LOOP =================
+// ===== DEPOSIT LOOP =====
 async function depositLoop() {
   try {
     const transfers = await fetchIncomingUsdtTransfers();
@@ -228,7 +228,7 @@ async function depositLoop() {
   }
 }
 
-// ================= START =================
+// ===== START =====
 async function init() {
   DECIMALS = await usdtRead.decimals();
   console.log("USDT decimals:", DECIMALS);
@@ -237,5 +237,4 @@ async function init() {
 
 await init();
 depositLoop();
-
 app.listen(PORT, () => console.log("Listening on port", PORT));
